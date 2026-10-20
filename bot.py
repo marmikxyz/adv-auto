@@ -26,6 +26,8 @@ from telethon.tl.types import ChatInviteAlready
 import db
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO)
+# keep httpx quiet so the bot token inside request URLs is never written to the logs
+logging.getLogger("httpx").setLevel(logging.WARNING)
 log = logging.getLogger("bot")
 
 # ------------------------------------------------------------------ config (env = defaults, /menu commands override)
@@ -514,6 +516,17 @@ def owner_only(fn):
     return wrapper
 
 
+def dm_unreachable(e: TelegramError) -> bool:
+    """True when the user can't be messaged because they never started the bot or blocked it.
+    Telegram answers Forbidden (blocked) or BadRequest 'Peer_id_invalid' / 'chat not found' (never started)."""
+    if isinstance(e, Forbidden):
+        return True
+    if isinstance(e, BadRequest):
+        m = str(e).lower()
+        return "peer_id_invalid" in m or "chat not found" in m or "user not found" in m
+    return False
+
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat, u = update.effective_chat, update.effective_user
     if chat.type != "private":
@@ -643,19 +656,32 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         target = chat.id
         if chat.type != "private" and on("group_dm"):
             try:
+                # probe: fails if the user never started the bot / blocked it
                 await context.bot.send_chat_action(q.from_user.id, ChatAction.TYPING)
-            except Forbidden:  # user never started the bot -> open it, the file follows
-                row = await ensure_stored(item)  # this file is about to be sent, so saving it is fine
-                if not row:
-                    await q.answer("❌ Could not prepare this file.", show_alert=True)
+            except TelegramError as e:
+                if dm_unreachable(e):
+                    # user never started the bot -> open the bot chat (Start button), the file follows
+                    row = await ensure_stored(item)  # this file is about to be sent, so saving it is fine
+                    if not row:
+                        await q.answer("❌ Could not prepare this file.", show_alert=True)
+                        return
+                    try:
+                        await q.answer(url=f"https://t.me/{context.bot.username}?start=f_{row['id']}")
+                    except TelegramError as ae:  # e.g. "query is too old" after a slow forward
+                        log.warning("answer(url) failed: %s", ae)
                     return
-                await q.answer(url=f"https://t.me/{context.bot.username}?start=f_{row['id']}")
+                log.exception("DM probe failed")
+                await q.answer("⚠️ Something went wrong, try again.", show_alert=True)
                 return
             target = q.from_user.id
             await q.answer("📩 Sending to your DM…")
         else:
             await q.answer("📤 Sending…")
         await safe_deliver(context, target, item)
+
+
+async def on_error(update, context: ContextTypes.DEFAULT_TYPE):
+    log.error("Unhandled error", exc_info=context.error)
 
 
 # ------------------------------------------------------------------ owner: helpers
@@ -1187,6 +1213,7 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(on_admin_cb, pattern=r"^adm:"))
     app.add_handler(CallbackQueryHandler(on_callback, pattern=r"^(pg|f|noop)"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    app.add_error_handler(on_error)
     app.run_polling(drop_pending_updates=True)
 
 
