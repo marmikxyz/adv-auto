@@ -7,75 +7,43 @@ import secrets
 import time
 from functools import wraps
 
-from telegram import (
-    BotCommand, BotCommandScopeChat, BotCommandScopeDefault,
-    InlineKeyboardButton, InlineKeyboardMarkup, Update,
-)
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction, ParseMode
-from telegram.error import BadRequest, Forbidden, RetryAfter, TelegramError
+from telegram.error import BadRequest, Forbidden, TelegramError
 from telegram.ext import (
     ApplicationBuilder, CallbackQueryHandler, CommandHandler,
     ContextTypes, MessageHandler, filters,
 )
-from telethon import TelegramClient, utils
+from telethon import TelegramClient, events
 from telethon.errors import FloodWaitError
 from telethon.sessions import StringSession
-from telethon.tl.functions.messages import CheckChatInviteRequest, ImportChatInviteRequest
-from telethon.tl.types import ChatInviteAlready
+from telethon.tl.types import InputMessagesFilterDocument, InputMessagesFilterVideo
 
 import db
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO)
+# keep httpx quiet so the bot token inside request URLs is not written to the logs
+logging.getLogger("httpx").setLevel(logging.WARNING)
 log = logging.getLogger("bot")
 
-# ------------------------------------------------------------------ config (env = defaults, /menu commands override)
+# ------------------------------------------------------------------ config
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 API_ID = int(os.environ["API_ID"])
 API_HASH = os.environ["API_HASH"]
 TG_SESSION = os.environ["TG_SESSION"]
-CHANNELS = [c.strip() for c in os.environ.get("CHANNELS", "").split(",") if c.strip()]  # imported once into the DB
+CHANNELS = [c.strip() for c in os.environ.get("CHANNELS", "").split(",") if c.strip()]
 OWNERS = {int(x) for x in os.environ.get("OWNER_IDS", "").replace(" ", "").split(",") if x}
+CACHE_DAYS = int(os.environ.get("CACHE_DAYS", "30"))
 PER_CHANNEL = int(os.environ.get("PER_CHANNEL_LIMIT", "200"))
-RESULT_TTL = int(os.environ.get("RESULT_TTL", "600"))  # seconds a search result list is kept in RAM (not DB)
-
-WELCOME_DEFAULT = (os.environ.get("WELCOME_TEXT") or
-    "👋 Hello <b>{name}</b>!\n\nSend me the name of a movie or series and I will find it for you."
-).replace("\\n", "\n")
-
-DEFAULTS = {
-    "welcome": WELCOME_DEFAULT,
-    "welcome_photo": os.environ.get("WELCOME_PHOTO", ""),
-    "support_url": os.environ.get("SUPPORT_URL", ""),
-    "dm_search": "1",
-    "group_search": "1",
-    "group_dm": "1" if os.environ.get("GROUP_FILES_TO_DM", "true").lower() == "true" else "0",
-    "clean_min": os.environ.get("CLEAN_MIN", "1"),
-    "delete_min": os.environ.get("FILE_DELETE_MIN", "10"),
-    "store_chat": os.environ.get("STORE_CHANNEL", "").strip(),
-}
-SET: dict[str, str] = {}  # values changed from inside Telegram (loaded from the DB at startup)
-
-
-def S(key: str) -> str:
-    return SET.get(key, DEFAULTS.get(key, ""))
-
-
-def on(key: str) -> bool:
-    return S(key) == "1"
-
-
-def fnum(key: str) -> float:
-    try:
-        return max(0.0, float(S(key)))
-    except ValueError:
-        return 0.0
-
-
-async def put(key: str, value: str) -> None:
-    SET[key] = value
-    await db.set_setting(key, value)
-
+GROUP_FILES_TO_DM = os.environ.get("GROUP_FILES_TO_DM", "true").lower() == "true"
+CLEAN_MIN = float(os.environ.get("CLEAN_MIN", "1"))
+FILE_DELETE_MIN = float(os.environ.get("FILE_DELETE_MIN", "10"))
+WELCOME = (os.environ.get("WELCOME_TEXT") or
+           "👋 Hello <b>{name}</b>!\n\nSend me the name of a movie or series and I will find it for you."
+           ).replace("\\n", "\n")
+WELCOME_PHOTO = os.environ.get("WELCOME_PHOTO", "")
+SUPPORT_URL = os.environ.get("SUPPORT_URL", "")
 
 PAGE = 10
 MAX_RESULTS = 300
@@ -83,12 +51,10 @@ COOLDOWN = 3.0
 ICON = {"video": "🎬", "document": "📁", "audio": "🎵"}
 
 user: TelegramClient | None = None  # your Telethon account (created in post_init)
-CHANNEL_ENTS: list = []             # source channels (Telethon entities)
-RESULT_CACHE: dict[str, tuple[float, list]] = {}  # keyword -> (time, rows)  -- RAM only, nothing is saved
-last_store_error = ""
+CHANNEL_ENTS: list = []             # resolved channels
+
 
 # ------------------------------------------------------------------ text helpers
-
 
 def norm(s: str) -> str:
     s = (s or "").lower()
@@ -212,8 +178,7 @@ def rank(rows, pq: dict) -> list[dict]:
             g, tier = 2, 3
         else:
             g, tier = 3, 4
-        # already-saved files come first inside the same tier (they send instantly)
-        groups[g].append(((tier, t, d["season"], d["episode"], d["quality"], not r["saved"], -r["msg_id"]), r))
+        groups[g].append(((tier, t, d["season"], d["episode"], d["quality"], -r["id"]), r))
     chosen = next((g for g in groups if g), [])
     chosen.sort(key=lambda x: x[0])
     seen, out = set(), []
@@ -222,7 +187,7 @@ def rank(rows, pq: dict) -> list[dict]:
         if key in seen:
             continue
         seen.add(key)
-        out.append({k: r[k] for k in ("chat_id", "msg_id", "kind", "name", "caption", "size", "saved")})
+        out.append({"id": r["id"], "caption": r["caption"], "size": r["size"], "kind": r["kind"]})
         if len(out) >= MAX_RESULTS:
             break
     return out
@@ -238,8 +203,7 @@ def fmt_size(b: int) -> str:
     return f"{b // 1024}KB"
 
 
-# ------------------------------------------------------------------ searching (Telethon -> RAM only, nothing saved)
-
+# ------------------------------------------------------------------ indexing (Telethon -> database)
 
 def media_kind(m) -> str | None:
     if m.video:
@@ -251,79 +215,87 @@ def media_kind(m) -> str | None:
     return None
 
 
-def build_row(m) -> dict | None:
-    """channel message -> plain dict (NOT written to the database)"""
+async def index_message(m) -> bool:
+    """save one channel message in the database; True if it was new"""
     kind = media_kind(m)
     if not kind or not m.file:
-        return None
+        return False
     name = clean_caption(m.file.name or "")
     caption = clean_caption(m.message or "") or name or "Untitled"
     n = norm(f"{caption} {name}")
     title = extract_title(norm(caption)) or extract_title(n)
-    return {"chat_id": m.chat_id, "msg_id": m.id, "kind": kind, "name": name, "caption": caption,
-            "title": title, "norm": n, "size": m.file.size or 0}
+    return await db.upsert_file(m.chat_id, m.id, kind, name, caption, title, n, m.file.size or 0)
+
+
+async def on_new_channel_post(event) -> None:
+    try:
+        await index_message(event.message)
+    except Exception:
+        log.exception("live index failed")
+
+
+async def resolve_channels() -> list:
+    await user.get_dialogs()  # fills Telethon's cache so numeric ids can be resolved
+    ents = []
+    for raw in CHANNELS:
+        try:
+            key = int(raw) if raw.lstrip("-").isdigit() else raw
+            ent = await user.get_entity(key)
+            ents.append(ent)
+            log.info("channel ok: %s", getattr(ent, "title", raw))
+        except Exception as e:
+            log.error("cannot open channel %s: %s (is your account a member?)", raw, e)
+    return ents
 
 
 _inflight: dict[str, asyncio.Task] = {}
 
 
-async def telethon_search(kw: str) -> list[dict]:
+async def telethon_search(kw: str) -> None:
+    """search all database channels with YOUR account and store every file found"""
     sem = asyncio.Semaphore(3)
+    failed = False
 
-    async def one(ent) -> list[dict]:
-        out = []
+    async def one(ent) -> int:
+        nonlocal failed
+        found = 0
         async with sem:
             try:
                 async for m in user.iter_messages(ent, search=kw, limit=PER_CHANNEL):
-                    r = build_row(m)
-                    if r:
-                        out.append(r)
+                    if await index_message(m):
+                        found += 1
             except FloodWaitError as e:
+                failed = True
                 log.warning("FloodWait %ss on %s", e.seconds, getattr(ent, "title", ent))
             except Exception:
+                failed = True
                 log.exception("search failed in %s", getattr(ent, "title", ent))
-        return out
+        return found
 
-    res = await asyncio.gather(*(one(e) for e in list(CHANNEL_ENTS)))
-    return [r for part in res for r in part]
+    res = await asyncio.gather(*(one(e) for e in CHANNEL_ENTS))
+    if not failed:  # only cache the keyword when every channel answered
+        await db.mark_keyword(kw, sum(res))
 
 
-async def live_rows(kw: str) -> list[dict]:
-    c = RESULT_CACHE.get(kw)
-    if c and time.time() - c[0] < RESULT_TTL:
-        return c[1]
+async def ensure_searched(kw: str) -> None:
+    if await db.keyword_fresh(kw, CACHE_DAYS):
+        return  # searched before -> Telethon is NOT used
     task = _inflight.get(kw)
     if task is None:  # the same keyword at the same time is searched only once
         task = asyncio.create_task(telethon_search(kw))
         _inflight[kw] = task
         task.add_done_callback(lambda _t: _inflight.pop(kw, None))
-    rows = await asyncio.shield(task)
-    if rows:
-        RESULT_CACHE[kw] = (time.time(), rows)
-        while len(RESULT_CACHE) > 200:
-            RESULT_CACHE.pop(next(iter(RESULT_CACHE)))
-    return rows
-
-
-def merge(live: list[dict], saved) -> list[dict]:
-    out: dict = {}
-    for r in live:
-        out[(r["chat_id"], r["msg_id"])] = dict(r, saved=False)
-    for r in saved:  # a saved file wins over the live copy of the same message
-        out[(r["chat_id"], r["msg_id"])] = dict(r, saved=True)
-    return list(out.values())
+    await asyncio.shield(task)
 
 
 async def get_results(pq: dict) -> list[dict]:
-    kw = " ".join(pq["words"])
-    live: list[dict] = []
-    if user and CHANNEL_ENTS:
-        try:
-            live = await live_rows(kw)
-        except Exception:
-            log.exception("telethon search error, using saved files only")
-    saved = await db.find_saved(pq["words"])
-    return rank(merge(live, saved), pq)
+    kw = " ".join(pq["words"])  # "ace 720p" and "ace" share one Telethon search
+    try:
+        await ensure_searched(kw)
+    except Exception:
+        log.exception("telethon search error, using saved files only")
+    rows = await db.find_candidates(pq["words"])
+    return rank(rows, pq)
 
 
 # ------------------------------------------------------------------ sessions (pagination state, in memory)
@@ -349,7 +321,7 @@ def new_session(uid: int, name: str, q: str, items: list, ctype: str) -> str:
 
 def get_session(sid: str) -> dict | None:
     s = SESS.get(sid)
-    if s and time.time() - s["at"] > 3600:
+    if s and time.time() - s["at"] > 1800:
         SESS.pop(sid, None)
         return None
     return s
@@ -377,22 +349,23 @@ def render(sid: str, page: int):
     page = max(0, min(page, pages - 1))
     chunk = items[page * PAGE:(page + 1) * PAGE]
     in_group = s["ctype"] != "private"
-    cm = fnum("clean_min")
     line = "━━━━━━━━━━━━━━━"
+
     text = f"🔎 <b>{html.escape(s['q'])}</b>\n"
     if in_group:
         text += f'👤 <a href="tg://user?id={s["uid"]}">{html.escape(s["name"])}</a>\n'
     text += f"{line}\n📂 Results: <b>{len(items)}</b> 📄 Page: <b>{page + 1}</b>/<b>{pages}</b>\n{line}\n"
-    text += "👇 <i>Tap a file — I will send it to your DM</i>" if in_group and on("group_dm") \
+    text += "👇 <i>Tap a file — I will send it to your DM</i>" if in_group and GROUP_FILES_TO_DM \
         else "👇 <i>Tap a file to get it</i>"
-    if cm > 0:
-        text += f"\n⏳ <i>This message is removed in {cm:g} min</i>"
+    if CLEAN_MIN > 0:
+        text += f"\n⏳ <i>This message is removed in {CLEAN_MIN:g} min</i>"
+
     rows = []
-    for i, it in enumerate(chunk, start=page * PAGE):
+    for it in chunk:
         cap = re.sub(r"\s+", " ", clean_caption(it["caption"])) or "Untitled"
         size = f"{fmt_size(it['size'])} • " if it["size"] else ""
         rows.append([InlineKeyboardButton(f"{ICON.get(it['kind'], '📁')} {size}{cap}"[:60],
-                                          callback_data=f"f:{sid}:{i}")])
+                                          callback_data=f"f:{sid}:{it['id']}")])
     if pages > 1:
         nav = []
         if page > 0:
@@ -404,114 +377,50 @@ def render(sid: str, page: int):
     return text, InlineKeyboardMarkup(rows)
 
 
-# ------------------------------------------------------------------ saving + sending files
-#
-#  1st tap on a file : Telethon (your account) forwards it from the source channel into the STORAGE channel,
-#                      the file is saved in the database, the bot copies it from the storage channel to the user.
-#  next taps         : the bot copies it straight from the storage channel -> Telethon is NOT used.
-#  Only files that are really sent get saved.
+# ------------------------------------------------------------------ sending files (bot copies the post from the channel)
 
-_locks: dict[tuple, asyncio.Lock] = {}
-
-
-async def ensure_stored(item, force: bool = False):
-    """returns the saved DB row of this file (forwarding it to the storage channel if needed), or None"""
-    global last_store_error
-    key = (item["chat_id"], item["msg_id"])
-    lock = _locks.setdefault(key, asyncio.Lock())
-    async with lock:
-        try:
-            if not force:
-                row = await db.get_saved(*key)
-                if row:
-                    return row
-            store = int(S("store_chat") or 0)
-            if not store:
-                last_store_error = "No storage channel set. Use /setstore."
-                return None
-            if not user:
-                return None
-            store_ent = await user.get_entity(store)
-            src = next((e for e in CHANNEL_ENTS if utils.get_peer_id(e) == key[0]), key[0])
-            msg = await user.get_messages(src, ids=key[1])
-            if not msg or not media_kind(msg):
-                last_store_error = "The post no longer exists in the source channel."
-                return None
-            try:
-                fwd = await user.forward_messages(store_ent, msg, drop_author=True)
-            except TypeError:  # very old Telethon without drop_author
-                fwd = await user.forward_messages(store_ent, msg)
-            if isinstance(fwd, list):
-                fwd = fwd[0]
-            r = build_row(msg)
-            last_store_error = ""
-            return await db.save_file(r["chat_id"], r["msg_id"], store, fwd.id, r["kind"], r["name"],
-                                      r["caption"], r["title"], r["norm"], r["size"])
-        except FloodWaitError as e:
-            last_store_error = f"FloodWait {e.seconds}s"
-            log.warning("FloodWait %ss while storing a file", e.seconds)
-        except Exception as e:
-            last_store_error = f"{type(e).__name__}: {e}"
-            log.exception("could not store file in the storage channel")
-        finally:
-            _locks.pop(key, None)
-    return None
-
-
-async def deliver(context: ContextTypes.DEFAULT_TYPE, chat_id: int, item) -> None:
-    cap = clean_caption(item["caption"]) or item["name"] or "Untitled"
-    cap_html = f"<code>{html.escape(cap[:1000])}</code>"
-
-    async def cp(frm: int, mid: int):
-        return await context.bot.copy_message(chat_id=chat_id, from_chat_id=frm, message_id=mid,
-                                              caption=cap_html, parse_mode=ParseMode.HTML)
-
-    row = await ensure_stored(item)
-    if row:
-        try:
-            m = await cp(row["store_chat_id"], row["store_msg_id"])
-        except BadRequest as e:  # the copy in the storage channel was deleted -> store it again once
-            log.warning("stored copy missing (%s), storing again", e)
-            row = await ensure_stored(item, force=True)
-            if not row:
-                raise
-            m = await cp(row["store_chat_id"], row["store_msg_id"])
-    else:  # no storage channel / Telethon problem -> try the source channel directly (bot must be a member)
-        m = await cp(item["chat_id"], item["msg_id"])
-    dm = fnum("delete_min")
-    if dm > 0:
+async def deliver(context: ContextTypes.DEFAULT_TYPE, chat_id: int, row) -> None:
+    cap = clean_caption(row["caption"]) or row["name"] or "Untitled"
+    m = await context.bot.copy_message(
+        chat_id=chat_id, from_chat_id=row["chat_id"], message_id=row["msg_id"],
+        caption=f"<code>{html.escape(cap[:1000])}</code>", parse_mode=ParseMode.HTML,
+    )
+    if FILE_DELETE_MIN > 0:
         w = await context.bot.send_message(
-            chat_id, f"⚠️ <b>Please forward this file now!</b>\nI will delete it in <b>{dm:g} minutes</b>.",
+            chat_id, f"⚠️ <b>Please forward this file now!</b>\nI will delete it in <b>{FILE_DELETE_MIN:g} minutes</b>.",
             parse_mode=ParseMode.HTML, reply_to_message_id=m.message_id)
-        schedule_delete(context.bot, chat_id, [m.message_id, w.message_id], dm)
+        schedule_delete(context.bot, chat_id, [m.message_id, w.message_id], FILE_DELETE_MIN)
 
 
-async def safe_deliver(context, chat_id: int, item) -> None:
+async def safe_deliver(context, chat_id: int, row) -> None:
     try:
-        await deliver(context, chat_id, item)
-    except Exception as e:
-        log.error("sending file failed: %s | store error: %s", e, last_store_error)
-        text = "❌ Could not send this file."
-        if chat_id in OWNERS:  # owners get the real reason
-            text += (f"\n\n<b>Reason:</b> <code>{html.escape(str(e))[:300]}</code>"
-                     f"\n<b>Storage:</b> <code>{html.escape(last_store_error or 'ok')[:300]}</code>"
-                     "\n\nCheck /setstore (storage channel) and that your Telethon account + the bot are admins there.")
+        await deliver(context, chat_id, row)
+    except TelegramError as e:
+        log.error("copy_message failed (is the bot admin in channel %s?): %s", row["chat_id"], e)
         try:
-            await context.bot.send_message(chat_id, text, parse_mode=ParseMode.HTML)
+            await context.bot.send_message(chat_id, "❌ Could not send this file.")
         except TelegramError:
             pass
 
 
-# ------------------------------------------------------------------ user handlers
-
+# ------------------------------------------------------------------ handlers
 
 def owner_only(fn):
     @wraps(fn)
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if update.effective_user and update.effective_user.id in OWNERS:
             return await fn(update, context)
-
     return wrapper
+
+
+def dm_unreachable(e: TelegramError) -> bool:
+    """True when the user can't be messaged because they never started the bot or blocked it."""
+    if isinstance(e, Forbidden):
+        return True
+    if isinstance(e, BadRequest):
+        m = str(e).lower()
+        return "peer_id_invalid" in m or "chat not found" in m or "user not found" in m
+    return False
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -519,9 +428,10 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if chat.type != "private":
         return  # no /start reply in groups (spam control)
     await db.add_user(u.id, u.first_name or "")
+
     if context.args and context.args[0].startswith("f_"):  # opened from a group button
         try:
-            row = await db.get_saved_by_id(int(context.args[0][2:]))
+            row = await db.get_file(int(context.args[0][2:]))
         except ValueError:
             row = None
         if row:
@@ -529,15 +439,11 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await update.message.reply_text("❌ File not found.")
         return
-    text = S("welcome").replace("{name}", html.escape(u.first_name or ""))
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("📢 Support Channel", url=S("support_url"))]]) \
-        if S("support_url") else None
-    photo = S("welcome_photo")
-    if photo and len(text) <= 1000:
-        await update.message.reply_photo(photo, caption=text, parse_mode=ParseMode.HTML, reply_markup=kb)
-    elif photo:
-        await update.message.reply_photo(photo)
-        await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+
+    text = WELCOME.replace("{name}", html.escape(u.first_name or ""))
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("📢 Support Channel", url=SUPPORT_URL)]]) if SUPPORT_URL else None
+    if WELCOME_PHOTO and len(text) <= 1000:
+        await update.message.reply_photo(WELCOME_PHOTO, caption=text, parse_mode=ParseMode.HTML, reply_markup=kb)
     else:
         await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
 
@@ -545,14 +451,11 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type != "private":
         return
-    dm = fnum("delete_min")
-    text = ("Send the name of a movie or series, for example <code>money heist</code>.\n"
-            "You can add season, quality or language: <code>money heist s02 720p hindi</code>")
-    if dm > 0:
-        text += f"\n⚠️ Files are deleted after {dm:g} minutes — forward them first."
-    if update.effective_user.id in OWNERS:
-        text += "\n\n👑 You are an owner — open the control panel with /menu"
-    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+    await update.message.reply_text(
+        "Send the name of a movie or series, for example <code>money heist</code>.\n"
+        "You can add season, quality or language: <code>money heist s02 720p hindi</code>\n"
+        f"⚠️ Files are deleted after {FILE_DELETE_MIN:g} minutes — forward them first.",
+        parse_mode=ParseMode.HTML)
 
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -561,33 +464,31 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     q = msg.text.strip()
     private = chat.type == "private"
-    if private:
-        if not on("dm_search") and u.id not in OWNERS:
-            await msg.reply_text("🔒 Private search is switched off. Please search in our group.")
-            return
-    else:  # groups: approved groups only, short plain text only
-        if not on("group_search"):
-            return
+
+    if not private:  # groups: approved groups only, short plain text only
         if len(q) > 50 or re.search(r"\n|https?://|t\.me/|@\w", q) or len(q.split()) > 8:
             return
         if not await db.group_ok(chat.id):
             return
+
     pq = parse_query(q)
     if not pq["words"] or len(norm(q)) < 2:
         return
+
     now = time.time()  # anti-spam: one search per user every few seconds
     if now - COOL.get(u.id, 0) < COOLDOWN:
         return
     COOL[u.id] = now
     if len(COOL) > 5000:
         COOL.clear()
+
     status = None
     if private:
         await db.add_user(u.id, u.first_name or "")
         status = await msg.reply_text(f"🔍 Searching <b>{html.escape(q)}</b> …", parse_mode=ParseMode.HTML)
     else:
         await chat.send_action(ChatAction.TYPING)
-    cm = fnum("clean_min")
+
     try:
         items = await get_results(pq)
     except Exception:
@@ -595,36 +496,42 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if status:
             await status.edit_text("⚠️ Search is busy right now, please try again.")
         return
+
     if not items:
         if status:  # groups stay silent when nothing is found
             await status.edit_text(
                 f"🔎 <b>{html.escape(q)}</b>\n━━━━━━━━━━━━━━━\n❌ No files found.\n"
                 "💡 <i>Check the spelling or try fewer words.</i>", parse_mode=ParseMode.HTML)
-            schedule_delete(context.bot, chat.id, [status.message_id], cm)
+            schedule_delete(context.bot, chat.id, [status.message_id], CLEAN_MIN)
         return
+
     sid = new_session(u.id, u.first_name or "", q, items, chat.type)
     text, kb = render(sid, 0)
     if private:
         await status.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
-        schedule_delete(context.bot, chat.id, [status.message_id], cm)
+        schedule_delete(context.bot, chat.id, [status.message_id], CLEAN_MIN)
     else:
         sent = await msg.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
-        schedule_delete(context.bot, chat.id, [sent.message_id, msg.message_id], cm)
+        schedule_delete(context.bot, chat.id, [sent.message_id, msg.message_id], CLEAN_MIN)
 
 
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     parts = (q.data or "").split(":")
+
     if parts[0] == "noop":
         await q.answer()
         return
+
     s = get_session(parts[1]) if len(parts) > 1 else None
     if not s:
         await q.answer("Search expired, please search again.", show_alert=True)
         return
+
     if s["uid"] != q.from_user.id:  # only the person who searched can use the buttons
         await q.answer("🚫 This is not for you!\nSearch your own.", show_alert=True)
         return
+
     if parts[0] == "pg":
         text, kb = render(parts[1], int(parts[2]))
         try:
@@ -633,532 +540,124 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
         await q.answer()
         return
+
     if parts[0] == "f":
-        try:
-            item = s["items"][int(parts[2])]
-        except (ValueError, IndexError):
+        row = await db.get_file(int(parts[2]))
+        if not row:
             await q.answer("❌ File not found.", show_alert=True)
             return
+
         chat = q.message.chat
         target = chat.id
-        if chat.type != "private" and on("group_dm"):
+
+        if chat.type != "private" and GROUP_FILES_TO_DM:
             try:
+                # probe: fails if the user never started the bot / blocked it
                 await context.bot.send_chat_action(q.from_user.id, ChatAction.TYPING)
-            except Forbidden:  # user never started the bot -> open it, the file follows
-                row = await ensure_stored(item)  # this file is about to be sent, so saving it is fine
-                if not row:
-                    await q.answer("❌ Could not prepare this file.", show_alert=True)
+            except TelegramError as e:
+                if dm_unreachable(e):
+                    # opens the bot's DM with a Start button; the file is sent after /start
+                    await q.answer(url=f"https://t.me/{context.bot.username}?start=f_{row['id']}")
                     return
-                await q.answer(url=f"https://t.me/{context.bot.username}?start=f_{row['id']}")
+                log.exception("DM probe failed")
+                await q.answer("⚠️ Something went wrong, try again.", show_alert=True)
                 return
             target = q.from_user.id
             await q.answer("📩 Sending to your DM…")
         else:
-            await q.answer("📤 Sending…")
-        await safe_deliver(context, target, item)
+            await q.answer()
 
+        await safe_deliver(context, target, row)
 
-# ------------------------------------------------------------------ owner: helpers
 
+async def on_error(update, context: ContextTypes.DEFAULT_TYPE):
+    log.error("Unhandled error", exc_info=context.error)
 
-def parse_onoff(args) -> bool | None:
-    if not args:
-        return None
-    a = args[0].lower()
-    if a in ("on", "1", "yes", "enable", "true"):
-        return True
-    if a in ("off", "0", "no", "disable", "false"):
-        return False
-    return None
 
-
-def peer_id(ent) -> int:
-    return utils.get_peer_id(ent)
-
-
-async def resolve_ref(raw: str):
-    """@username, t.me/name, t.me/+invite, or -100123… id -> Telethon entity"""
-    raw = raw.strip()
-    m = re.search(r"(?:t\.me|telegram\.me)/(?:\+|joinchat/)([\w-]+)", raw)
-    if m:
-        info = await user(CheckChatInviteRequest(m.group(1)))
-        if isinstance(info, ChatInviteAlready):
-            return info.chat
-        upd = await user(ImportChatInviteRequest(m.group(1)))  # joins the channel with your account
-        return upd.chats[0]
-    m = re.search(r"(?:t\.me|telegram\.me)/([A-Za-z0-9_]{4,})", raw)
-    if m:
-        raw = m.group(1)
-    raw = raw.lstrip("@")
-    if raw.lstrip("-").isdigit():
-        await user.get_dialogs()  # fills Telethon's cache so numeric ids can be resolved
-        return await user.get_entity(int(raw))
-    return await user.get_entity(raw)
-
-
-async def stats_text() -> str:
-    st = await db.stats()
-    store = S("store_chat") or "not set"
-    return ("📊 <b>Bot Stats</b>\n\n"
-            f"👤 Users: {st['users']}\n🎬 Saved files: {st['files']}\n"
-            f"📡 Source channels: {len(CHANNEL_ENTS)}\n👥 Approved groups: {st['groups']}\n"
-            f"🗄 Storage channel: <code>{html.escape(store)}</code>")
-
-
-# ------------------------------------------------------------------ owner: control panel (/menu)
-
-TOGGLES = {"dm_search": "DM search", "group_search": "Group search", "group_dm": "Group files → DM"}
-
-OWNER_COMMANDS = [
-    ("menu", "Admin control panel"),
-    ("setphoto", "Set welcome photo (reply to a photo)"),
-    ("delphoto", "Remove welcome photo"),
-    ("setwelcome", "Set welcome text ({name} = user name)"),
-    ("resetwelcome", "Reset welcome text to default"),
-    ("setsupport", "Set support channel link (or off)"),
-    ("addsource", "Add a source channel manually"),
-    ("delsource", "Remove a source channel"),
-    ("sources", "List source channels"),
-    ("setstore", "Set the storage channel"),
-    ("dmsearch", "DM search on/off"),
-    ("groupsearch", "Group search on/off"),
-    ("groupdm", "Send group files to DM on/off"),
-    ("approve", "Approve a group"),
-    ("disapprove", "Remove a group"),
-    ("groups", "List approved groups"),
-    ("broadcast", "Broadcast to users / groups / all"),
-    ("setclean", "Result list auto-delete minutes (0 = off)"),
-    ("setdelete", "Sent file auto-delete minutes (0 = off)"),
-    ("stats", "Bot statistics"),
-    ("clearcache", "Clear the search result cache"),
-    ("help", "Help"),
-]
-USER_COMMANDS = [("start", "Start the bot"), ("help", "How to search")]
-
-
-def panel():
-    def btn(key):
-        return InlineKeyboardButton(f"{'✅' if on(key) else '❌'} {TOGGLES[key]}", callback_data=f"adm:t:{key}")
-
-    text = ("🛠 <b>Control Panel</b>\n\n"
-            f"🔎 DM search: <b>{'ON' if on('dm_search') else 'OFF'}</b>\n"
-            f"👥 Group search: <b>{'ON' if on('group_search') else 'OFF'}</b>\n"
-            f"📩 Group files → DM: <b>{'ON' if on('group_dm') else 'OFF'}</b>\n"
-            f"📡 Source channels: <b>{len(CHANNEL_ENTS)}</b>\n"
-            f"🗄 Storage channel: <b>{'set' if S('store_chat') else 'NOT SET'}</b>\n"
-            f"🖼 Welcome photo: <b>{'set' if S('welcome_photo') else 'none'}</b>\n"
-            f"⏳ Result list delete: <b>{fnum('clean_min'):g} min</b> | File delete: <b>{fnum('delete_min'):g} min</b>")
-    kb = InlineKeyboardMarkup([
-        [btn("dm_search"), btn("group_search")],
-        [btn("group_dm")],
-        [InlineKeyboardButton("📊 Stats", callback_data="adm:stats"),
-         InlineKeyboardButton("📡 Sources", callback_data="adm:sources")],
-        [InlineKeyboardButton("👥 Groups", callback_data="adm:groups"),
-         InlineKeyboardButton("📜 All commands", callback_data="adm:cmds")],
-        [InlineKeyboardButton("🔄 Refresh", callback_data="adm:refresh")],
-    ])
-    return text, kb
-
-
-@owner_only
-async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text, kb = panel()
-    await update.effective_message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
-
-
-def sources_text() -> str:
-    lines = [f"{i}. {html.escape(getattr(e, 'title', str(e)))}  <code>{peer_id(e)}</code>"
-             for i, e in enumerate(CHANNEL_ENTS, 1)]
-    return "📡 <b>Source channels</b>\n\n" + ("\n".join(lines) if lines else "(none) — add one with /addsource")
-
-
-async def groups_text(bot) -> str:
-    lines = []
-    for cid in await db.all_groups():
-        try:
-            title = (await bot.get_chat(cid)).title or ""
-        except TelegramError:
-            title = ""
-        lines.append(f"• {html.escape(title)} <code>{cid}</code>")
-    return "👥 <b>Approved groups</b>\n\n" + ("\n".join(lines) if lines else "(none) — use /approve inside a group")
-
-
-async def on_admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    if q.from_user.id not in OWNERS:
-        await q.answer("Owners only.", show_alert=True)
-        return
-    parts = q.data.split(":")
-    action = parts[1]
-    if action == "t" and parts[2] in TOGGLES:
-        await put(parts[2], "0" if on(parts[2]) else "1")
-        action = "refresh"
-    if action == "refresh":
-        text, kb = panel()
-        try:
-            await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
-        except BadRequest:
-            pass
-        await q.answer("Updated")
-        return
-    await q.answer()
-    m = q.message
-    if action == "stats":
-        await m.reply_text(await stats_text(), parse_mode=ParseMode.HTML)
-    elif action == "sources":
-        await m.reply_text(sources_text(), parse_mode=ParseMode.HTML)
-    elif action == "groups":
-        await m.reply_text(await groups_text(context.bot), parse_mode=ParseMode.HTML)
-    elif action == "cmds":
-        await m.reply_text("📜 <b>Commands</b>\n\n" + "\n".join(f"/{c} — {d}" for c, d in OWNER_COMMANDS),
-                           parse_mode=ParseMode.HTML)
-
-
-# ------------------------------------------------------------------ owner: welcome / photo / support
-
-
-@owner_only
-async def cmd_setphoto(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.effective_message
-    photos = msg.photo or (msg.reply_to_message.photo if msg.reply_to_message else None)
-    if not photos:
-        await msg.reply_text("Reply to a photo with /setphoto, or send a photo with the caption /setphoto")
-        return
-    await put("welcome_photo", photos[-1].file_id)
-    await msg.reply_text("🖼 Welcome photo saved.")
-
-
-@owner_only
-async def cmd_delphoto(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await put("welcome_photo", "")
-    await update.effective_message.reply_text("🗑 Welcome photo removed.")
-
-
-@owner_only
-async def cmd_setwelcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.effective_message
-    if msg.reply_to_message and (msg.reply_to_message.text or msg.reply_to_message.caption):
-        text = msg.reply_to_message.text_html or msg.reply_to_message.caption_html
-    else:
-        parts = (msg.text_html or "").split(None, 1)
-        text = parts[1] if len(parts) > 1 else ""
-    if not text:
-        await msg.reply_text("Usage: /setwelcome <text>  (or reply to a text with /setwelcome)\n"
-                             "Use {name} for the user's name. HTML like <b>bold</b> works.")
-        return
-    await put("welcome", text)
-    await msg.reply_text("📝 Welcome text saved. Preview:")
-    await msg.reply_text(text.replace("{name}", html.escape(update.effective_user.first_name or "")),
-                         parse_mode=ParseMode.HTML)
-
-
-@owner_only
-async def cmd_resetwelcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await put("welcome", WELCOME_DEFAULT)
-    await update.effective_message.reply_text("♻️ Welcome text reset to default.")
-
-
-@owner_only
-async def cmd_setsupport(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.effective_message.reply_text("Usage: /setsupport https://t.me/yourchannel   (or /setsupport off)")
-        return
-    val = context.args[0]
-    if val.lower() == "off":
-        await put("support_url", "")
-        await update.effective_message.reply_text("Support button removed.")
-        return
-    if not val.startswith("http"):
-        val = "https://t.me/" + val.lstrip("@")
-    await put("support_url", val)
-    await update.effective_message.reply_text(f"✅ Support link saved: {val}")
-
-
-# ------------------------------------------------------------------ owner: source channels / storage channel
-
-
-@owner_only
-async def cmd_addsource(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.effective_message
-    if not context.args:
-        await msg.reply_text("Usage: /addsource @channel | t.me/channel | t.me/+invite | -100123456789\n"
-                             "Your Telethon account must be able to open it (private invite links are joined for you).")
-        return
-    ref = " ".join(context.args)
-    try:
-        ent = await resolve_ref(ref)
-    except Exception as e:
-        await msg.reply_text(f"❌ Cannot open that channel: {e}")
-        return
-    cid = peer_id(ent)
-    if any(peer_id(e) == cid for e in CHANNEL_ENTS):
-        await msg.reply_text("Already added.")
-        return
-    title = getattr(ent, "title", None) or ref
-    await db.add_source(cid, title, ref)
-    CHANNEL_ENTS.append(ent)
-    RESULT_CACHE.clear()
-    await msg.reply_text(f"✅ Source added: {title}\nTotal sources: {len(CHANNEL_ENTS)}")
-
-
-@owner_only
-async def cmd_delsource(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.effective_message
-    if not context.args:
-        await msg.reply_text("Usage: /delsource <number from /sources> | <channel id> | @username")
-        return
-    arg = context.args[0].strip()
-    target = None
-    if arg.isdigit() and 1 <= int(arg) <= len(CHANNEL_ENTS):
-        target = CHANNEL_ENTS[int(arg) - 1]
-    else:
-        for e in CHANNEL_ENTS:
-            if arg.lstrip("-").isdigit() and peer_id(e) == int(arg):
-                target = e
-            elif getattr(e, "username", None) and e.username.lower() == arg.lstrip("@").lower():
-                target = e
-    if not target:
-        await msg.reply_text("Not found. See /sources")
-        return
-    CHANNEL_ENTS.remove(target)
-    await db.del_source(peer_id(target))
-    RESULT_CACHE.clear()
-    await msg.reply_text(f"🗑 Removed: {getattr(target, 'title', arg)}")
-
-
-@owner_only
-async def cmd_sources(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text(sources_text(), parse_mode=ParseMode.HTML)
-
-
-@owner_only
-async def cmd_setstore(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """storage channel: your Telethon account forwards files here, the bot copies them to users"""
-    msg = update.effective_message
-    if not context.args:
-        cur = S("store_chat") or "not set"
-        await msg.reply_text(
-            f"🗄 Storage channel: <code>{html.escape(cur)}</code>\n\n"
-            "Create a private channel, add <b>the bot</b> and <b>your Telethon account</b> as admins "
-            "(allow posting), then send:\n<code>/setstore -100xxxxxxxxxx</code>",
-            parse_mode=ParseMode.HTML)
-        return
-    try:
-        ent = await resolve_ref(" ".join(context.args))
-    except Exception as e:
-        await msg.reply_text(f"❌ Telethon cannot open that channel: {e}")
-        return
-    cid = peer_id(ent)
-    warn = ""
-    try:
-        t = await context.bot.send_message(cid, "✅ Storage channel connected.")
-        await context.bot.delete_message(cid, t.message_id)
-    except TelegramError as e:
-        warn = f"\n⚠️ The bot cannot post there ({e}). Make the bot an admin of that channel."
-    await put("store_chat", str(cid))
-    await msg.reply_text(f"✅ Storage channel saved: {getattr(ent, 'title', cid)} (<code>{cid}</code>){warn}",
-                         parse_mode=ParseMode.HTML)
-
-
-# ------------------------------------------------------------------ owner: toggles / timers / groups / stats
-
-
-async def _toggle(update: Update, context: ContextTypes.DEFAULT_TYPE, key: str):
-    v = parse_onoff(context.args)
-    if v is None:
-        v = not on(key)  # no argument -> flip
-    await put(key, "1" if v else "0")
-    await update.effective_message.reply_text(f"{TOGGLES[key]}: {'ON ✅' if v else 'OFF ❌'}")
-
-
-@owner_only
-async def cmd_dmsearch(update, context):
-    await _toggle(update, context, "dm_search")
-
-
-@owner_only
-async def cmd_groupsearch(update, context):
-    await _toggle(update, context, "group_search")
-
-
-@owner_only
-async def cmd_groupdm(update, context):
-    await _toggle(update, context, "group_dm")
-
-
-async def _set_minutes(update: Update, context: ContextTypes.DEFAULT_TYPE, key: str, label: str):
-    try:
-        v = max(0.0, float(context.args[0]))
-    except (IndexError, ValueError):
-        await update.effective_message.reply_text(f"Usage: /{'setclean' if key == 'clean_min' else 'setdelete'} <minutes>  (0 = never)")
-        return
-    await put(key, str(v))
-    await update.effective_message.reply_text(f"⏳ {label}: {v:g} min" if v else f"⏳ {label}: off")
-
-
-@owner_only
-async def cmd_setclean(update, context):
-    await _set_minutes(update, context, "clean_min", "Result list auto-delete")
-
-
-@owner_only
-async def cmd_setdelete(update, context):
-    await _set_minutes(update, context, "delete_min", "File auto-delete")
-
+# ------------------------------------------------------------------ admin commands (OWNER_IDS)
 
 @owner_only
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text(await stats_text(), parse_mode=ParseMode.HTML)
+    st = await db.stats()
+    await update.message.reply_text(
+        "📊 Bot Stats\n\n"
+        f"👤 Users: {st['users']}\n🎬 Saved files: {st['files']}\n"
+        f"🔑 Cached keywords: {st['keywords']}\n👥 Approved groups: {st['groups']}\n"
+        f"📡 Channels: {len(CHANNEL_ENTS)} of {len(CHANNELS)} opened")
+
+
+@owner_only
+async def cmd_channels(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lines = [f"• {getattr(e, 'title', e)}" for e in CHANNEL_ENTS] or ["(none opened)"]
+    await update.message.reply_text("📡 Database channels:\n" + "\n".join(lines))
 
 
 @owner_only
 async def cmd_clearcache(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    n = len(RESULT_CACHE)
-    RESULT_CACHE.clear()
-    await update.effective_message.reply_text(f"🗑 Cleared {n} cached search(es). Saved files are untouched.")
+    kw = norm(" ".join(context.args)) or None
+    n = await db.clear_cache(kw)
+    await update.message.reply_text(f"🗑 Cleared {n} cached keyword(s). They will be searched again with Telethon.")
 
 
 @owner_only
 async def cmd_approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cid = int(context.args[0]) if context.args and context.args[0].lstrip("-").isdigit() else update.effective_chat.id
     if cid > 0:
-        await update.effective_message.reply_text("Use /approve inside the group, or /approve -100xxxxxxxxxx")
+        await update.message.reply_text("Use /approve inside the group, or /approve -100xxxxxxxxxx")
         return
     await db.add_group(cid)
-    await update.effective_message.reply_text(f"✅ Group approved: {cid}")
+    await update.message.reply_text(f"✅ Group approved: {cid}")
 
 
 @owner_only
 async def cmd_disapprove(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cid = int(context.args[0]) if context.args and context.args[0].lstrip("-").isdigit() else update.effective_chat.id
     await db.del_group(cid)
-    await update.effective_message.reply_text(f"🚫 Group removed: {cid}")
+    await update.message.reply_text(f"🚫 Group removed: {cid}")
 
 
 @owner_only
-async def cmd_groups(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text(await groups_text(context.bot), parse_mode=ParseMode.HTML)
-
-
-# ------------------------------------------------------------------ owner: broadcast
-
-TARGETS = ("users", "groups", "all")
-
-
-@owner_only
-async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/broadcast [users|groups|all] <text>     or reply to any message with /broadcast [target]"""
-    msg = update.effective_message
-    parts = (msg.text_html or "").split(None, 1)
-    rest = parts[1] if len(parts) > 1 else ""
-    target = "users"
-    first = rest.split(None, 1)[0].lower() if rest else ""
-    if first in TARGETS:
-        target = first
-        rest = rest[len(first):].strip()
-    reply = msg.reply_to_message
-    if not reply and not rest:
-        await msg.reply_text("Usage:\n/broadcast <text>  → all users\n/broadcast groups <text>\n/broadcast all <text>\n"
-                             "Or reply to any message (photo, video, text…) with /broadcast [users|groups|all]")
-        return
-    targets: list[tuple[int, str]] = []
-    if target in ("users", "all"):
-        targets += [(i, "user") for i in await db.all_users()]
-    if target in ("groups", "all"):
-        targets += [(i, "group") for i in await db.all_groups()]
-    if not targets:
-        await msg.reply_text("Nobody to send to.")
-        return
-    status = await msg.reply_text(f"📣 Broadcasting to {len(targets)} chat(s)…")
+async def cmd_index(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """save EVERY video/file of all channels in the database (optional, run once)"""
+    status = await update.message.reply_text("📚 Indexing all channels… this can take a while.")
 
     async def run():
-        ok = fail = 0
-        for n, (cid, kind) in enumerate(targets, 1):
-            for _ in range(2):
+        total, last = 0, time.time()
+        for ent in CHANNEL_ENTS:
+            for flt in (InputMessagesFilterVideo, InputMessagesFilterDocument):
                 try:
-                    if reply:
-                        await context.bot.copy_message(cid, reply.chat_id, reply.message_id)
-                    else:
-                        await context.bot.send_message(cid, rest, parse_mode=ParseMode.HTML)
-                    ok += 1
-                    break
-                except RetryAfter as e:
-                    await asyncio.sleep(e.retry_after + 1)
-                except Forbidden:
-                    fail += 1
-                    if kind == "user":  # blocked the bot -> forget the user
-                        await db.del_user(cid)
-                    break
-                except TelegramError:
-                    fail += 1
-                    break
-            else:
-                fail += 1
-            await asyncio.sleep(0.05)
-            if n % 50 == 0:
-                try:
-                    await status.edit_text(f"📣 Broadcasting… {n}/{len(targets)}")
-                except TelegramError:
-                    pass
-        try:
-            await status.edit_text(f"✅ Broadcast finished.\nSent: {ok}\nFailed: {fail}")
-        except TelegramError:
-            pass
+                    async for m in user.iter_messages(ent, filter=flt):
+                        if await index_message(m):
+                            total += 1
+                            if time.time() - last > 15:
+                                last = time.time()
+                                try:
+                                    await status.edit_text(f"📚 Indexing… {total} new files saved")
+                                except TelegramError:
+                                    pass
+                except Exception:
+                    log.exception("index failed in %s", getattr(ent, "title", ent))
+        await status.edit_text(f"✅ Index finished: {total} new files saved.")
 
     spawn(run())
 
 
 # ------------------------------------------------------------------ startup
 
-
-async def load_sources() -> None:
-    await user.get_dialogs()  # fills Telethon's cache so numeric ids can be resolved
-    if SET.get("env_imported") != "1":  # CHANNELS from the env are imported once, then the DB is the master list
-        for raw in CHANNELS:
-            try:
-                ent = await resolve_ref(raw)
-                await db.add_source(peer_id(ent), getattr(ent, "title", raw), raw)
-            except Exception as e:
-                log.error("cannot open channel %s: %s (is your account a member?)", raw, e)
-        await put("env_imported", "1")
-    CHANNEL_ENTS.clear()
-    for r in await db.list_sources():
-        try:
-            ent = await user.get_entity(r["chat_id"])
-        except Exception:
-            try:
-                ent = await resolve_ref(r["ref"])
-            except Exception as e:
-                log.error("cannot open source %s (%s): %s", r["title"], r["chat_id"], e)
-                continue
-        CHANNEL_ENTS.append(ent)
-        log.info("source ok: %s", getattr(ent, "title", r["chat_id"]))
-    if not CHANNEL_ENTS:
-        log.warning("No source channel yet. Add one with /addsource")
-
-
 async def post_init(app) -> None:
-    global user
+    global user, CHANNEL_ENTS
     await db.init()
-    SET.update(await db.load_settings())
     user = TelegramClient(StringSession(TG_SESSION), API_ID, API_HASH, flood_sleep_threshold=60)
     await user.connect()
     if not await user.is_user_authorized():
         raise SystemExit("TG_SESSION is not valid. Create a new one with gen_session.py")
     me = await user.get_me()
     log.info("Telethon logged in as %s", me.first_name)
-    await load_sources()
-    # command menu: normal users see /start /help, owners see everything
-    try:
-        await app.bot.set_my_commands([BotCommand(c, d) for c, d in USER_COMMANDS], scope=BotCommandScopeDefault())
-    except TelegramError:
-        log.exception("set_my_commands (default) failed")
-    for oid in OWNERS:
-        try:
-            await app.bot.set_my_commands([BotCommand(c, d) for c, d in OWNER_COMMANDS],
-                                          scope=BotCommandScopeChat(oid))
-        except TelegramError as e:
-            log.warning("owner menu for %s not set (open the bot and press /start first): %s", oid, e)
+    CHANNEL_ENTS = await resolve_channels()
+    if CHANNEL_ENTS:  # new videos posted in your channels are saved instantly
+        user.add_event_handler(on_new_channel_post, events.NewMessage(chats=CHANNEL_ENTS))
+    else:
+        log.warning("No channel could be opened. Check CHANNELS and that your account joined them.")
 
 
 async def post_shutdown(app) -> None:
@@ -1170,23 +669,17 @@ async def post_shutdown(app) -> None:
 def main() -> None:
     app = (ApplicationBuilder().token(BOT_TOKEN).concurrent_updates(True)
            .post_init(post_init).post_shutdown(post_shutdown).build())
-    cmds = {
-        "start": cmd_start, "help": cmd_help, "menu": cmd_menu,
-        "setphoto": cmd_setphoto, "delphoto": cmd_delphoto,
-        "setwelcome": cmd_setwelcome, "resetwelcome": cmd_resetwelcome, "setsupport": cmd_setsupport,
-        "addsource": cmd_addsource, "delsource": cmd_delsource, "sources": cmd_sources, "setstore": cmd_setstore,
-        "dmsearch": cmd_dmsearch, "groupsearch": cmd_groupsearch, "groupdm": cmd_groupdm,
-        "approve": cmd_approve, "disapprove": cmd_disapprove, "groups": cmd_groups,
-        "broadcast": cmd_broadcast, "setclean": cmd_setclean, "setdelete": cmd_setdelete,
-        "stats": cmd_stats, "clearcache": cmd_clearcache,
-    }
-    for name, fn in cmds.items():
-        app.add_handler(CommandHandler(name, fn))
-    # photo sent together with the caption /setphoto
-    app.add_handler(MessageHandler(filters.PHOTO & filters.CaptionRegex(r"^/setphoto"), cmd_setphoto))
-    app.add_handler(CallbackQueryHandler(on_admin_cb, pattern=r"^adm:"))
-    app.add_handler(CallbackQueryHandler(on_callback, pattern=r"^(pg|f|noop)"))
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("stats", cmd_stats))
+    app.add_handler(CommandHandler("channels", cmd_channels))
+    app.add_handler(CommandHandler("clearcache", cmd_clearcache))
+    app.add_handler(CommandHandler("approve", cmd_approve))
+    app.add_handler(CommandHandler("disapprove", cmd_disapprove))
+    app.add_handler(CommandHandler("index", cmd_index))
+    app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    app.add_error_handler(on_error)
     app.run_polling(drop_pending_updates=True)
 
 
