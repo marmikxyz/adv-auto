@@ -516,17 +516,6 @@ def owner_only(fn):
     return wrapper
 
 
-def dm_unreachable(e: TelegramError) -> bool:
-    """True when the user can't be messaged because they never started the bot or blocked it.
-    Telegram answers Forbidden (blocked) or BadRequest 'Peer_id_invalid' / 'chat not found' (never started)."""
-    if isinstance(e, Forbidden):
-        return True
-    if isinstance(e, BadRequest):
-        m = str(e).lower()
-        return "peer_id_invalid" in m or "chat not found" in m or "user not found" in m
-    return False
-
-
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat, u = update.effective_chat, update.effective_user
     if chat.type != "private":
@@ -653,31 +642,22 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.answer("❌ File not found.", show_alert=True)
             return
         chat = q.message.chat
-        target = chat.id
         if chat.type != "private" and on("group_dm"):
-            try:
-                # probe: fails if the user never started the bot / blocked it
-                await context.bot.send_chat_action(q.from_user.id, ChatAction.TYPING)
-            except TelegramError as e:
-                if dm_unreachable(e):
-                    # user never started the bot -> open the bot chat (Start button), the file follows
-                    row = await ensure_stored(item)  # this file is about to be sent, so saving it is fine
-                    if not row:
-                        await q.answer("❌ Could not prepare this file.", show_alert=True)
-                        return
-                    try:
-                        await q.answer(url=f"https://t.me/{context.bot.username}?start=f_{row['id']}")
-                    except TelegramError as ae:  # e.g. "query is too old" after a slow forward
-                        log.warning("answer(url) failed: %s", ae)
-                    return
-                log.exception("DM probe failed")
-                await q.answer("⚠️ Something went wrong, try again.", show_alert=True)
+            # ALWAYS open the bot chat from a group: the file is sent after /start with its id
+            row = await ensure_stored(item)  # saves the file once (instant if it is already saved)
+            if not row:
+                msg = "❌ Could not prepare this file."
+                if q.from_user.id in OWNERS and last_store_error:
+                    msg += f"\n{last_store_error}"
+                await q.answer(msg[:190], show_alert=True)
                 return
-            target = q.from_user.id
-            await q.answer("📩 Sending to your DM…")
-        else:
-            await q.answer("📤 Sending…")
-        await safe_deliver(context, target, item)
+            try:
+                await q.answer(url=f"https://t.me/{context.bot.username}?start=f_{row['id']}")
+            except TelegramError as e:
+                log.warning("answer(url) failed: %s", e)
+            return
+        await q.answer("📤 Sending…")
+        await safe_deliver(context, chat.id, item)
 
 
 async def on_error(update, context: ContextTypes.DEFAULT_TYPE):
